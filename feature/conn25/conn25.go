@@ -983,6 +983,20 @@ var (
 		"conn25_map_dns_response_rewrite_unsupported_question_type_error_servfail",
 	)
 
+	// metricDNSResponsePassThroughErrorServfail increments servfail returns on
+	// an error writing through a response whose question type is in
+	// passThroughQuestionTypes.
+	metricDNSResponsePassThroughErrorServfail = clientmetric.NewCounter(
+		"conn25_map_dns_response_pass_through_error_servfail",
+	)
+
+	// metricDNSResponsePassedThrough increments when a response for an app
+	// connector domain is written through unrewritten because its question
+	// type is in passThroughQuestionTypes.
+	metricDNSResponsePassedThrough = clientmetric.NewCounter(
+		"conn25_map_dns_response_passed_through",
+	)
+
 	// metricDNSResponseSkippedAAAA4In6 increments when an AAAA answer for an
 	// app connector domain is dropped because it holds an IPv4-in-IPv6 address.
 	metricDNSResponseSkippedAAAA4In6 = clientmetric.NewCounter(
@@ -1030,13 +1044,25 @@ func (c *Conn25) mapDNSResponse(buf []byte) []byte {
 	// There is guaranteed to be at least one matching app, so just take the first one for now
 	appName := appNames[0]
 
-	// Now we know this is a dns response we think we should rewrite, we're going to provide our response which
-	// currently means we will:
-	//  * write the questions through as they are
-	//  * not send through the additional section
-	//  * provide our answers, or no answers if we don't handle those answers (possibly in the future we should write through answers for eg TypeTXT)
-	//   * We handle A, AAAA and HTTPS type questions
-	//   * We drop all others
+	// Now we know this is a DNS response for a domain we route via a connector,
+	// so we answer it ourselves rather than letting the upstream answer stand.
+	// In every case we write the questions through as they are, and we never
+	// write through the authority or additional sections. What we put in the
+	// answer section depends on the question type, and falls into three cases.
+	//
+	// 1. Rewrite. A and AAAA answers are replaced with magic IPs, and HTTPS
+	//    answers have their ipv4hint/ipv6hint SvcParams stripped.
+	//
+	//    These are the only records that could otherwise let the client reach
+	//    the destination without transiting the connector, because they are the
+	//    only ones whose RDATA holds an IP address literal.
+	//
+	// 2. Pass through, for the question types in passThroughQuestionTypes. See
+	//    that var for why those types are safe, and passThroughResponse for what
+	//    we filter out of them.
+	//
+	// 3. Drop, i.e. an empty answer section, for everything else. See
+	//    passThroughQuestionTypes for why this is the default.
 
 	// Question Type HTTPS
 	if question.Type == dnsmessage.TypeHTTPS {
@@ -1046,6 +1072,18 @@ func (c *Conn25) mapDNSResponse(buf []byte) []byte {
 			c.logf("error rewriting HTTPS dns response: %v", err)
 			return makeServFail(c.logf, hdr, question)
 		}
+		return newBuf
+	}
+
+	// Question types that can't carry an address are written through as-is.
+	if passThroughQuestionTypes.Contains(question.Type) {
+		newBuf, err := passThroughResponse(hdr, questions, question.Type, &p)
+		if err != nil {
+			metricDNSResponsePassThroughErrorServfail.Add(1)
+			c.logf("error passing through dns response of type %v: %v", question.Type, err)
+			return makeServFail(c.logf, hdr, question)
+		}
+		metricDNSResponsePassedThrough.Add(1)
 		return newBuf
 	}
 
@@ -1178,6 +1216,69 @@ func (c *Conn25) mapDNSResponse(buf []byte) []byte {
 		return makeServFail(c.logf, hdr, question)
 	}
 	return newBuf
+}
+
+// passThroughQuestionTypes are the question types whose upstream answers we
+// write through instead of rewriting or dropping them.
+//
+// The test for membership is that the record's RDATA cannot contain an IP
+// address literal, so writing it through cannot let a client reach the
+// destination without transiting the connector.
+//
+// Types whose RDATA is a name (CNAME, MX, NS, PTR, SRV) qualify, because a name
+// is indirection: the client has to resolve it, and that query comes back
+// through [Conn25.mapDNSResponse]. Note that this does mean traffic to an
+// SRV or MX target only transits a connector if the target's own domain is
+// also covered by the app's domain config. Types whose RDATA is neither a name
+// nor an address (SOA, TXT) can't affect routing at all.
+var passThroughQuestionTypes = set.Of(
+	dnsmessage.TypeCNAME,
+	dnsmessage.TypeMX,
+	dnsmessage.TypeNS,
+	dnsmessage.TypePTR,
+	dnsmessage.TypeSOA,
+	dnsmessage.TypeSRV,
+	dnsmessage.TypeTXT,
+)
+
+// passThroughResponse writes through the answers of a DNS response for a
+// question type in passThroughQuestionTypes. p must be positioned at the
+// start of the answer section (i.e. the questions are already consumed).
+//
+// Two things are filtered out, both for the same reason: an address we hand to
+// the client is an address the client can connect to directly, bypassing the
+// connector.
+//
+//   - The authority and additional sections are dropped. Responses to SRV, MX
+//     and NS questions routinely carry A/AAAA glue for the target in the
+//     additional section, and unlike an SRV target that glue costs the client
+//     no second query, so it would be a real bypass.
+//   - Answers are filtered to the question type plus CNAME, so that an upstream
+//     that puts, say, an A record in the answer section of a TXT response
+//     doesn't get it written through to the client (or into its DNS cache).
+func passThroughResponse(
+	hdr dnsmessage.Header,
+	questions []dnsmessage.Question,
+	qType dnsmessage.Type,
+	p *dnsmessage.Parser,
+) ([]byte, error) {
+	// AllAnswers stops at the end of the answer section, so the authority and
+	// additional sections are dropped by never being read.
+	answers, err := p.AllAnswers()
+	if err != nil {
+		return nil, err
+	}
+	answers = slices.DeleteFunc(answers, func(r dnsmessage.Resource) bool {
+		return r.Header.Type != qType && r.Header.Type != dnsmessage.TypeCNAME
+	})
+	// Message.Pack recomputes the section counts and re-packs each answer
+	// without us needing to switch on its type.
+	m := dnsmessage.Message{
+		Header:    hdr,
+		Questions: questions,
+		Answers:   answers,
+	}
+	return m.Pack()
 }
 
 // rewriteHTTPSResponse writes through the HTTPS (type 65) answers in a DNS

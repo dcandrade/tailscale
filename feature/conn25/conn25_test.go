@@ -1032,7 +1032,11 @@ func makeDNSResponseForSections(t *testing.T, questions []dnsmessage.Question, a
 			body, _ := ans.Body.(*dnsmessage.SVCBResource)
 			b.SVCBResource(ans.Header, *body)
 		default:
-			t.Fatalf("unhandled answer type, update test: %v", ans.Header.Type)
+			body, ok := ans.Body.(*dnsmessage.UnknownResource)
+			if !ok {
+				t.Fatalf("unhandled answer type, update test: %v", ans.Header.Type)
+			}
+			b.UnknownResource(ans.Header, *body)
 		}
 	}
 
@@ -1040,11 +1044,14 @@ func makeDNSResponseForSections(t *testing.T, questions []dnsmessage.Question, a
 		t.Fatal(err)
 	}
 	for _, add := range additional {
-		body, ok := add.Body.(*dnsmessage.AResource)
-		if !ok {
-			t.Fatalf("unexpected additional type, update test")
+		switch body := add.Body.(type) {
+		case *dnsmessage.AResource:
+			b.AResource(add.Header, *body)
+		case *dnsmessage.AAAAResource:
+			b.AAAAResource(add.Header, *body)
+		default:
+			t.Fatalf("unexpected additional type, update test: %v", add.Header.Type)
 		}
-		b.AResource(add.Header, *body)
 	}
 
 	outbs, err := b.Finish()
@@ -2272,28 +2279,34 @@ func TestMapDNSResponseDropsUnhandledTypes(t *testing.T) {
 	}}, arbitraryPools, []string{})
 	cfg := mustConfig(t, sn)
 
+	// Question types not in passThroughQuestionTypes get an empty answer
+	// section, whatever the upstream said.
 	unhandled := []struct {
+		name string
 		typ  dnsmessage.Type
 		body dnsmessage.ResourceBody
 	}{
-		{dnsmessage.TypeNS, &dnsmessage.NSResource{NS: dnsMessageName}},
-		{dnsmessage.TypeCNAME, &dnsmessage.CNAMEResource{CNAME: dnsMessageName}},
-		{dnsmessage.TypeSOA, &dnsmessage.SOAResource{NS: dnsMessageName, MBox: dnsMessageName, Serial: 1}},
-		{dnsmessage.TypePTR, &dnsmessage.PTRResource{PTR: dnsMessageName}},
-		{dnsmessage.TypeMX, &dnsmessage.MXResource{Pref: 10, MX: dnsMessageName}},
-		{dnsmessage.TypeTXT, &dnsmessage.TXTResource{TXT: []string{"hello"}}},
-		{dnsmessage.TypeSRV, &dnsmessage.SRVResource{Priority: 1, Weight: 1, Port: 443, Target: dnsMessageName}},
-		{dnsmessage.TypeOPT, &dnsmessage.OPTResource{}},
-		{dnsmessage.TypeSVCB, &dnsmessage.SVCBResource{Priority: 1, Target: dnsMessageName}},
+		{"OPT", dnsmessage.TypeOPT, &dnsmessage.OPTResource{}},
+		{"SVCB", dnsmessage.TypeSVCB, &dnsmessage.SVCBResource{Priority: 1, Target: dnsMessageName}},
+
+		// An ANY question can be answered with address records, so it is not written through either
+		{"ANY", dnsmessage.TypeALL, &dnsmessage.AResource{A: [4]byte{1, 2, 3, 4}}},
+
+		// An RR type we've never looked at fails closed rather than being written through.
+		{"unknown", dnsmessage.Type(1234), &dnsmessage.UnknownResource{Type: dnsmessage.Type(1234), Data: []byte{1, 2, 3}}},
 	}
 	for _, tt := range unhandled {
-		t.Run(tt.typ.String(), func(t *testing.T) {
+		t.Run(tt.name, func(t *testing.T) {
+			answerType := tt.typ
+			if tt.typ == dnsmessage.TypeALL {
+				answerType = dnsmessage.TypeA
+			}
 			toMap := makeDNSResponseForSections(
 				t,
 				[]dnsmessage.Question{{Name: dnsMessageName, Type: tt.typ, Class: dnsmessage.ClassINET}},
 				[]dnsmessage.Resource{
 					{
-						Header: dnsmessage.ResourceHeader{Name: dnsMessageName, Type: tt.typ, Class: dnsmessage.ClassINET, TTL: 300},
+						Header: dnsmessage.ResourceHeader{Name: dnsMessageName, Type: answerType, Class: dnsmessage.ClassINET, TTL: 300},
 						Body:   tt.body,
 					},
 				},
@@ -2305,6 +2318,155 @@ func TestMapDNSResponseDropsUnhandledTypes(t *testing.T) {
 			answers, _ := parseResponse(t, bs)
 			if len(answers) != 0 {
 				t.Fatalf("expected response to be dropped (0 answers), got %d: %v", len(answers), answers)
+			}
+		})
+	}
+}
+
+// TestMapDNSResponseWritesThroughNonAddressTypes checks that a question type
+// whose RDATA can't hold an address is answered with the upstream records
+// rather than an empty answer section.
+func TestMapDNSResponseWritesThroughNonAddressTypes(t *testing.T) {
+	configuredDomain := "example.com"
+	dnsMessageName := dnsmessage.MustNewName(configuredDomain + ".")
+	targetName := dnsmessage.MustNewName("target.example.net.")
+	sn := makeSelfNode(t, []appctype.Conn25Attr{{
+		Name:       "app1",
+		Connectors: []string{"tag:connector"},
+		Domains:    []string{configuredDomain},
+	}}, arbitraryPools, []string{})
+	cfg := mustConfig(t, sn)
+
+	writtenThrough := []struct {
+		name string
+		typ  dnsmessage.Type
+		body dnsmessage.ResourceBody
+	}{
+		{"CNAME", dnsmessage.TypeCNAME, &dnsmessage.CNAMEResource{CNAME: targetName}},
+		{"MX", dnsmessage.TypeMX, &dnsmessage.MXResource{Pref: 10, MX: targetName}},
+		{"NS", dnsmessage.TypeNS, &dnsmessage.NSResource{NS: targetName}},
+		{"PTR", dnsmessage.TypePTR, &dnsmessage.PTRResource{PTR: targetName}},
+		{"SOA", dnsmessage.TypeSOA, &dnsmessage.SOAResource{NS: targetName, MBox: targetName, Serial: 1, MinTTL: 60}},
+		{"SRV", dnsmessage.TypeSRV, &dnsmessage.SRVResource{Priority: 1, Weight: 1, Port: 443, Target: targetName}},
+		{"TXT", dnsmessage.TypeTXT, &dnsmessage.TXTResource{TXT: []string{"hello"}}},
+	}
+	for _, tt := range writtenThrough {
+		t.Run(tt.name, func(t *testing.T) {
+			hdr := dnsmessage.ResourceHeader{Name: dnsMessageName, Type: tt.typ, Class: dnsmessage.ClassINET, TTL: 300}
+			toMap := makeDNSResponseForSections(
+				t,
+				[]dnsmessage.Question{{Name: dnsMessageName, Type: tt.typ, Class: dnsmessage.ClassINET}},
+				[]dnsmessage.Resource{{Header: hdr, Body: tt.body}},
+				nil,
+			)
+			c := newConn25(logger.Discard)
+			c.reconfig(cfg)
+			answers, _ := parseResponse(t, c.mapDNSResponse(toMap))
+			if len(answers) != 1 {
+				t.Fatalf("got %d answers, want 1: %v", len(answers), answers)
+			}
+			if got := answers[0].Header.Type; got != tt.typ {
+				t.Errorf("answer type got %v, want %v", got, tt.typ)
+			}
+			if got := answers[0].Header.Name.String(); got != dnsMessageName.String() {
+				t.Errorf("answer name got %q, want %q", got, dnsMessageName.String())
+			}
+			if got := answers[0].Header.TTL; got != 300 {
+				t.Errorf("answer TTL got %d, want 300", got)
+			}
+			if diff := cmp.Diff(tt.body, answers[0].Body); diff != "" {
+				t.Errorf("answer body mismatch (-want +got):\n%s", diff)
+			}
+		})
+	}
+}
+
+// TestMapDNSResponseWriteThroughStripsAddresses checks that the write-through
+// path doesn't hand the client a real destination address, which it could
+// otherwise connect to directly instead of transiting the connector.
+func TestMapDNSResponseWriteThroughStripsAddresses(t *testing.T) {
+	configuredDomain := "example.com"
+	dnsMessageName := dnsmessage.MustNewName(configuredDomain + ".")
+	targetName := dnsmessage.MustNewName("target.example.net.")
+	sn := makeSelfNode(t, []appctype.Conn25Attr{{
+		Name:       "app1",
+		Connectors: []string{"tag:connector"},
+		Domains:    []string{configuredDomain},
+	}}, arbitraryPools, []string{})
+	cfg := mustConfig(t, sn)
+
+	srvHdr := dnsmessage.ResourceHeader{Name: dnsMessageName, Type: dnsmessage.TypeSRV, Class: dnsmessage.ClassINET, TTL: 300}
+	srvBody := &dnsmessage.SRVResource{Priority: 1, Weight: 1, Port: 443, Target: targetName}
+	glueV4Hdr := dnsmessage.ResourceHeader{Name: targetName, Type: dnsmessage.TypeA, Class: dnsmessage.ClassINET, TTL: 300}
+	glueV6Hdr := dnsmessage.ResourceHeader{Name: targetName, Type: dnsmessage.TypeAAAA, Class: dnsmessage.ClassINET, TTL: 300}
+
+	for _, tt := range []struct {
+		name        string
+		questions   []dnsmessage.Question
+		answers     []dnsmessage.Resource
+		additionals []dnsmessage.Resource
+		wantAnswers int
+	}{
+		{
+			// The common shape: an SRV response with A/AAAA glue for the
+			// target. The glue costs the client no second query, so passing it
+			// on would let it reach the destination directly.
+			name:      "srv glue in additional section is dropped",
+			questions: []dnsmessage.Question{{Name: dnsMessageName, Type: dnsmessage.TypeSRV, Class: dnsmessage.ClassINET}},
+			answers:   []dnsmessage.Resource{{Header: srvHdr, Body: srvBody}},
+			additionals: []dnsmessage.Resource{
+				{Header: glueV4Hdr, Body: &dnsmessage.AResource{A: [4]byte{93, 184, 216, 34}}},
+				{Header: glueV6Hdr, Body: &dnsmessage.AAAAResource{AAAA: netip.MustParseAddr("2606:2800:220:1::1").As16()}},
+			},
+			wantAnswers: 1,
+		},
+		{
+			// An upstream that stuffs address records into the answer section
+			// of a non-address response doesn't get them written through.
+			name:      "unsolicited address answers are dropped",
+			questions: []dnsmessage.Question{{Name: dnsMessageName, Type: dnsmessage.TypeTXT, Class: dnsmessage.ClassINET}},
+			answers: []dnsmessage.Resource{
+				{
+					Header: dnsmessage.ResourceHeader{Name: dnsMessageName, Type: dnsmessage.TypeTXT, Class: dnsmessage.ClassINET, TTL: 300},
+					Body:   &dnsmessage.TXTResource{TXT: []string{"hello"}},
+				},
+				{Header: glueV4Hdr, Body: &dnsmessage.AResource{A: [4]byte{93, 184, 216, 34}}},
+				{Header: glueV6Hdr, Body: &dnsmessage.AAAAResource{AAAA: netip.MustParseAddr("2606:2800:220:1::1").As16()}},
+			},
+			wantAnswers: 1,
+		},
+		{
+			// CNAMEs alongside the answer are kept: a name is indirection, and
+			// the client's query for it comes back through mapDNSResponse.
+			name:      "cname chain is kept",
+			questions: []dnsmessage.Question{{Name: dnsMessageName, Type: dnsmessage.TypeSRV, Class: dnsmessage.ClassINET}},
+			answers: []dnsmessage.Resource{
+				{
+					Header: dnsmessage.ResourceHeader{Name: dnsMessageName, Type: dnsmessage.TypeCNAME, Class: dnsmessage.ClassINET, TTL: 300},
+					Body:   &dnsmessage.CNAMEResource{CNAME: targetName},
+				},
+				{Header: srvHdr, Body: srvBody},
+			},
+			wantAnswers: 2,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			toMap := makeDNSResponseForSections(t, tt.questions, tt.answers, tt.additionals)
+			c := newConn25(logger.Discard)
+			c.reconfig(cfg)
+			answers, additionals := parseResponse(t, c.mapDNSResponse(toMap))
+			if len(answers) != tt.wantAnswers {
+				t.Errorf("got %d answers, want %d: %v", len(answers), tt.wantAnswers, answers)
+			}
+			if len(additionals) != 0 {
+				t.Errorf("got %d additionals, want 0: %v", len(additionals), additionals)
+			}
+			// Belt and braces: no address record anywhere in the response.
+			for _, r := range slices.Concat(answers, additionals) {
+				switch r.Body.(type) {
+				case *dnsmessage.AResource, *dnsmessage.AAAAResource:
+					t.Errorf("address record written through: %v", r)
+				}
 			}
 		})
 	}
